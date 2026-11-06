@@ -1,465 +1,404 @@
-import asyncio
 import json
+import sqlite3
+import subprocess
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
 
-import flet as ft
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:  # pragma: no cover - GUI is optional for non-desktop tests
+    tk = None
+    ttk = None
+    messagebox = None
 
-
-DATA_FILE = Path.home() / ".daily_note_tasks.json"
-GAME_TIMER_FILE = Path.home() / ".game_time_limit.json"
-GREEN = "#2E6654"
-GREEN_LIGHT = "#E2EDE5"
-PAPER = "#F6F5EF"
-INK = "#202C2A"
-MUTED = "#77807B"
-CORAL = "#CF6048"
-
-
-def load_tasks():
-    try:
-        tasks = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        if isinstance(tasks, list):
-            return [
-                task
-                for task in tasks
-                if isinstance(task, dict)
-                and isinstance(task.get("id"), str)
-                and isinstance(task.get("text"), str)
-                and isinstance(task.get("done"), bool)
-            ]
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
+try:
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+except Exception:  # pragma: no cover - handled gracefully if matplotlib is missing
+    FigureCanvasTkAgg = None
+    Figure = None
 
 
-def save_tasks(tasks):
-    DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+APP_DIR = Path.home() / ".game_time_manager"
+DB_PATH = APP_DIR / "game_usage.db"
+CONFIG_PATH = APP_DIR / "config.json"
 
 
-def load_timer_state():
-    try:
-        state = json.loads(GAME_TIMER_FILE.read_text(encoding="utf-8"))
-        if isinstance(state, dict):
-            return {
-                "date": str(state.get("date", "")),
-                "limit_seconds": max(60, int(state.get("limit_seconds", 3600))),
-                "elapsed_seconds": max(0, int(state.get("elapsed_seconds", 0))),
-                "started_at": max(0.0, float(state.get("started_at", 0))),
-            }
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-    return {"date": "", "limit_seconds": 3600, "elapsed_seconds": 0, "started_at": 0}
+def format_duration(total_seconds):
+    total_seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def save_timer_state(state):
-    try:
-        GAME_TIMER_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
+class GameUsageTracker:
+    """SQLite-backed daily/weekly game usage tracker."""
 
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path) if db_path and db_path != ":memory:" else (":memory:" if db_path == ":memory:" else DB_PATH)
+        if self.db_path != ":memory:":
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path) if self.db_path != ":memory:" else ":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self._init_db()
+        self._seed_default_limits()
 
-def format_duration(seconds):
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, remaining_seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
-
-
-def main(page: ft.Page):
-    page.title = "今日の段取り | ToDo"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = PAPER
-    page.padding = 24
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.scroll = ft.ScrollMode.AUTO
-
-    tasks = load_tasks()
-    current_filter = "all"
-
-    today = date.today()
-    timer_state = load_timer_state()
-    if timer_state["date"] != today.isoformat():
-        timer_state = {
-            "date": today.isoformat(),
-            "limit_seconds": timer_state["limit_seconds"],
-            "elapsed_seconds": 0,
-            "started_at": 0,
-        }
-        save_timer_state(timer_state)
-
-    timer_running = timer_state["started_at"] > 0
-    limit_hours = ft.TextField(
-        label="1日の上限（時間）",
-        value=str(timer_state["limit_seconds"] / 3600),
-        width=180,
-        input_filter=ft.NumbersOnlyInputFilter(),
-        keyboard_type=ft.KeyboardType.NUMBER,
-    )
-    remaining_text = ft.Text(size=44, weight=ft.FontWeight.BOLD, color=INK)
-    timer_status = ft.Text(size=12, color=MUTED)
-    timer_button = ft.Button(
-        "ゲーム開始",
-        width=140,
-        height=44,
-        bgcolor=GREEN,
-        color="white",
-        on_click=lambda event: toggle_timer(event),
-    )
-
-    def current_elapsed():
-        elapsed = timer_state["elapsed_seconds"]
-        if timer_state["started_at"]:
-            elapsed += max(0, time.time() - timer_state["started_at"])
-        return min(elapsed, timer_state["limit_seconds"])
-
-    def refresh_timer():
-        nonlocal timer_running
-        if timer_state["date"] != date.today().isoformat():
-            timer_state.update(
-                date=date.today().isoformat(),
-                limit_seconds=timer_state["limit_seconds"],
-                elapsed_seconds=0,
-                started_at=0,
+    def _init_db(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
-            save_timer_state(timer_state)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_date TEXT NOT NULL,
+                minutes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
 
-        elapsed = current_elapsed()
-        remaining = timer_state["limit_seconds"] - elapsed
-        timer_running = timer_state["started_at"] > 0
-        remaining_text.value = format_duration(remaining)
-        timer_status.value = "残り時間" if timer_running else "停止中"
-        timer_button.text = "停止" if timer_running else "ゲーム開始"
-        timer_button.bgcolor = CORAL if timer_running else GREEN
-        timer_button.color = "white"
+    def _seed_default_limits(self):
+        if self.get_limit("daily_minutes") is None:
+            self.set_limits(120, 420)
 
-        if remaining <= 0:
-            timer_state["elapsed_seconds"] = timer_state["limit_seconds"]
-            timer_state["started_at"] = 0
-            timer_running = False
-            timer_status.value = "今日の上限に到達"
-            timer_button.text = "リセット"
-            timer_button.bgcolor = GREEN
-            save_timer_state(timer_state)
-        page.update()
+    def _save_limit(self, key, value):
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(int(value))),
+        )
+        self.conn.commit()
 
-    def apply_limit(event):
+    def get_limit(self, key, default=None):
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
         try:
-            hours = float(limit_hours.value)
-            if not 0.25 <= hours <= 24:
-                raise ValueError
+            return int(row["value"])
         except (TypeError, ValueError):
-            timer_status.value = "0.25〜24時間で入力してください"
-            page.update()
+            return default
+
+    def set_limits(self, daily_minutes, weekly_minutes):
+        self._save_limit("daily_minutes", max(0, int(daily_minutes)))
+        self._save_limit("weekly_minutes", max(0, int(weekly_minutes)))
+
+    def get_daily_limit(self):
+        return self.get_limit("daily_minutes", 120)
+
+    def get_weekly_limit(self):
+        return self.get_limit("weekly_minutes", 420)
+
+    def log_session(self, session_date, minutes):
+        minutes = max(0, int(minutes))
+        if minutes <= 0:
             return
+        self.conn.execute(
+            "INSERT INTO sessions(session_date, minutes, created_at) VALUES (?, ?, ?)",
+            (session_date, minutes, datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
 
-        elapsed = current_elapsed()
-        timer_state["limit_seconds"] = int(hours * 3600)
-        timer_state["elapsed_seconds"] = min(int(elapsed), timer_state["limit_seconds"])
-        timer_state["started_at"] = time.time() if timer_running else 0
-        save_timer_state(timer_state)
-        refresh_timer()
+    def get_daily_usage(self, session_date=None):
+        target_date = (session_date or date.today().isoformat())
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(minutes), 0) AS total FROM sessions WHERE session_date = ?",
+            (target_date,),
+        ).fetchone()
+        return int(row["total"]) if row else 0
 
-    def toggle_timer(event):
-        if current_elapsed() >= timer_state["limit_seconds"]:
-            timer_state["elapsed_seconds"] = 0
-            timer_state["started_at"] = 0
-            save_timer_state(timer_state)
-            refresh_timer()
-            return
+    def get_week_usage(self, session_date=None):
+        target_date = date.fromisoformat(session_date or date.today().isoformat())
+        start_of_week = target_date - timedelta(days=target_date.weekday())
+        end_of_week = start_of_week + timedelta(days=6)
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(minutes), 0) AS total FROM sessions WHERE session_date BETWEEN ? AND ?",
+            (start_of_week.isoformat(), end_of_week.isoformat()),
+        ).fetchone()
+        return int(row["total"]) if row else 0
 
-        if timer_state["started_at"]:
-            timer_state["elapsed_seconds"] = int(current_elapsed())
-            timer_state["started_at"] = 0
-        else:
-            timer_state["started_at"] = time.time()
-        save_timer_state(timer_state)
-        refresh_timer()
+    def get_remaining_daily(self, session_date=None):
+        usage = self.get_daily_usage(session_date)
+        return max(self.get_daily_limit() - usage, 0)
 
-    async def update_timer():
-        while True:
-            await asyncio.sleep(1)
-            refresh_timer()
+    def get_remaining_weekly(self, session_date=None):
+        usage = self.get_week_usage(session_date)
+        return max(self.get_weekly_limit() - usage, 0)
 
-    task_input = ft.TextField(
-        hint_text="次にやることは？",
-        expand=True,
-        autofocus=True,
-        border_radius=6,
-        border_color="#D4DED5",
-        focused_border_color=GREEN,
-        bgcolor="#FFFEFA",
-        text_size=15,
-        on_submit=lambda event: add_task(event),
-    )
-    task_list = ft.Column(spacing=0)
-    task_count = ft.Text(color=MUTED, size=12)
-    progress_label = ft.Text(color=MUTED, size=11)
-    clear_done_button = ft.TextButton(
-        "完了した項目を削除",
-        icon=ft.Icons.DELETE_OUTLINE,
-        style=ft.ButtonStyle(color=CORAL),
-        on_click=lambda event: clear_done(event),
-    )
-    filter_buttons = {}
+    def is_daily_locked(self, session_date=None):
+        return self.get_daily_usage(session_date) >= self.get_daily_limit()
 
-    def persist():
+    def is_weekly_locked(self, session_date=None):
+        return self.get_week_usage(session_date) >= self.get_weekly_limit()
+
+    def get_last_7_days_usage(self):
+        today = date.today()
+        history = []
+        for offset in range(6, -1, -1):
+            d = today - timedelta(days=offset)
+            history.append({"date": d.isoformat(), "usage": self.get_daily_usage(d.isoformat())})
+        return history
+
+
+class GameTimeManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Game Time Manager")
+        self.root.geometry("920x640")
+        self.root.minsize(860, 560)
+
+        self.tracker = GameUsageTracker()
+        self.active_session_started_at = None
+        self.active_session_date = date.today().isoformat()
+        self.warning_sent = set()
+        self.locked_notification_sent = False
+
+        self._build_ui()
+        self._sync_limits_from_tracker()
+        self.refresh_all()
+        self.root.after(1000, self._tick)
+
+    def _build_ui(self):
+        self.root.configure(bg="#f3f4f6")
+
+        heading = ttk.Label(
+            self.root,
+            text="ゲーム依存症対策タイムマネージャー",
+            font=("Helvetica", 22, "bold"),
+            background="#f3f4f6",
+        )
+        heading.pack(anchor="w", padx=20, pady=(18, 8))
+
+        top = ttk.Frame(self.root, padding=12)
+        top.pack(fill="x", padx=16)
+
+        limit_frame = ttk.LabelFrame(top, text="制限設定", padding=16)
+        limit_frame.pack(side="left", fill="y", padx=(0, 16))
+
+        ttk.Label(limit_frame, text="1日のゲーム時間（時間）").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 6))
+        self.daily_limit_entry = ttk.Entry(limit_frame, width=12)
+        self.daily_limit_entry.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
+
+        ttk.Label(limit_frame, text="1週間のゲーム時間（時間）").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 6))
+        self.weekly_limit_entry = ttk.Entry(limit_frame, width=12)
+        self.weekly_limit_entry.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(0, 6))
+
+        ttk.Button(limit_frame, text="制限を保存", command=self._save_limits).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        status_frame = ttk.Frame(top)
+        status_frame.pack(side="left", fill="both", expand=True)
+
+        self.status_card = ttk.LabelFrame(status_frame, text="現在の状態", padding=18)
+        self.status_card.pack(fill="x")
+
+        self.status_label = ttk.Label(self.status_card, text="待機中", font=("Helvetica", 18, "bold"), foreground="#1d4ed8")
+        self.status_label.pack(anchor="w")
+
+        self.remaining_label = ttk.Label(self.status_card, text="残り: 00:00:00", font=("Helvetica", 14, "bold"))
+        self.remaining_label.pack(anchor="w", pady=(8, 0))
+
+        usage_row = ttk.Frame(self.status_card)
+        usage_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(usage_row, text="今日の使用時間: ", font=("Helvetica", 11, "bold")).pack(side="left")
+        self.today_usage_label = ttk.Label(usage_row, text="00:00:00", font=("Helvetica", 11))
+        self.today_usage_label.pack(side="left")
+
+        week_row = ttk.Frame(self.status_card)
+        week_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(week_row, text="今週の使用時間: ", font=("Helvetica", 11, "bold")).pack(side="left")
+        self.week_usage_label = ttk.Label(week_row, text="00:00:00", font=("Helvetica", 11))
+        self.week_usage_label.pack(side="left")
+
+        self.session_buttons = ttk.Frame(self.status_card)
+        self.session_buttons.pack(fill="x", pady=(16, 0))
+        self.start_button = ttk.Button(self.session_buttons, text="ゲーム開始", command=self.start_session)
+        self.start_button.pack(side="left", padx=(0, 10))
+        self.stop_button = ttk.Button(self.session_buttons, text="ゲーム終了", command=self.stop_session)
+        self.stop_button.pack(side="left")
+
+        self.message_var = tk.StringVar(value="制限内で使えます。")
+        ttk.Label(self.status_card, textvariable=self.message_var, foreground="#374151", wraplength=520).pack(anchor="w", pady=(12, 0))
+
+        graph_frame = ttk.LabelFrame(self.root, text="過去7日間の使用量", padding=12)
+        graph_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.graph_container = ttk.Frame(graph_frame)
+        self.graph_container.pack(fill="both", expand=True)
+
+        self.chart_canvas = None
+
+    def _sync_limits_from_tracker(self):
+        self.daily_limit_entry.delete(0, tk.END)
+        self.weekly_limit_entry.delete(0, tk.END)
+        self.daily_limit_entry.insert(0, f"{self.tracker.get_daily_limit() / 60:.1f}")
+        self.weekly_limit_entry.insert(0, f"{self.tracker.get_weekly_limit() / 60:.1f}")
+
+    def _save_limits(self):
         try:
-            save_tasks(tasks)
-            progress_label.value = f"{sum(task['done'] for task in tasks)} / {len(tasks)} 件 完了"
-        except OSError:
-            progress_label.value = "保存できませんでした。書き込み権限をご確認ください。"
-
-    def set_filter(value):
-        nonlocal current_filter
-        current_filter = value
-        render()
-
-    def add_task(event):
-        text = task_input.value.strip()
-        if not text:
+            daily_hours = float(self.daily_limit_entry.get())
+            weekly_hours = float(self.weekly_limit_entry.get())
+        except ValueError:
+            messagebox.showwarning("入力エラー", "数値を正しく入力してください。")
             return
-        tasks.insert(0, {"id": str(uuid4()), "text": text, "done": False})
-        task_input.value = ""
-        persist()
-        set_filter("all")
 
-    def toggle_task(task_id):
-        for task in tasks:
-            if task["id"] == task_id:
-                task["done"] = not task["done"]
-                break
-        persist()
-        render()
+        if daily_hours <= 0 or weekly_hours <= 0:
+            messagebox.showwarning("入力エラー", "上限は0より大きい値を設定してください。")
+            return
 
-    def delete_task(task_id):
-        tasks[:] = [task for task in tasks if task["id"] != task_id]
-        persist()
-        render()
+        self.tracker.set_limits(int(daily_hours * 60), int(weekly_hours * 60))
+        self._sync_limits_from_tracker()
+        self.refresh_all()
 
-    def clear_done(event):
-        tasks[:] = [task for task in tasks if not task["done"]]
-        persist()
-        render()
+    def _notify(self, title, message):
+        if not message:
+            return
+        try:
+            subprocess.run(["notify-send", title, message], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            print(f"{title}: {message}")
 
-    def render():
-        visible_tasks = [
-            task
-            for task in tasks
-            if current_filter == "all"
-            or (current_filter == "active" and not task["done"])
-            or (current_filter == "done" and task["done"])
-        ]
-        remaining = sum(not task["done"] for task in tasks)
-        completed = len(tasks) - remaining
-        task_count.value = f"未完了 {remaining} 件"
-        progress_label.value = (
-            f"{completed} / {len(tasks)} 件 完了" if tasks else "タスクはまだありません"
-        )
-        clear_done_button.visible = completed > 0
+    def _current_active_minutes(self):
+        if self.active_session_started_at is None:
+            return 0
+        return max(0, int((time.time() - self.active_session_started_at) / 60))
 
-        for key, button in filter_buttons.items():
-            selected = key == current_filter
-            button.style = ft.ButtonStyle(
-                color=GREEN if selected else MUTED,
-                bgcolor=GREEN_LIGHT if selected else "transparent",
-                shape=ft.RoundedRectangleBorder(radius=4),
-            )
+    def _today_usage_minutes(self):
+        return self.tracker.get_daily_usage(date.today().isoformat()) + self._current_active_minutes()
 
-        rows = []
-        for task in visible_tasks:
-            checkbox = ft.Checkbox(
-                value=task["done"],
-                label=task["text"],
-                expand=True,
-                active_color=GREEN,
-                label_style=ft.TextStyle(
-                    color="#929992" if task["done"] else INK,
-                    decoration=ft.TextDecoration.LINE_THROUGH if task["done"] else None,
-                    size=14,
-                ),
-                on_change=lambda event, task_id=task["id"]: toggle_task(task_id),
-            )
-            delete_button = ft.IconButton(
-                icon=ft.Icons.DELETE_OUTLINE,
-                icon_color=MUTED,
-                tooltip=f"「{task['text']}」を削除",
-                on_click=lambda event, task_id=task["id"]: delete_task(task_id),
-            )
-            rows.extend(
-                [
-                    ft.Row([checkbox, delete_button], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    ft.Divider(height=1, thickness=1, color="#DEDFD5"),
-                ]
-            )
+    def _week_usage_minutes(self):
+        return self.tracker.get_week_usage(date.today().isoformat()) + self._current_active_minutes()
 
-        if not visible_tasks:
-            empty_text = (
-                "未完了のタスクはありません。いい調子！"
-                if current_filter == "active" and tasks
-                else "完了したタスクはまだありません。"
-                if current_filter == "done" and tasks
-                else "まずは、やることをひとつ書いてみましょう。"
-            )
-            rows = [
-                ft.Container(
-                    content=ft.Column(
-                        [
-                            ft.Text("○", size=24, color="#9A7629", text_align=ft.TextAlign.CENTER),
-                            ft.Text(empty_text, size=13, color=MUTED, text_align=ft.TextAlign.CENTER),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=10,
-                    ),
-                    padding=32,
-                    alignment=ft.Alignment.CENTER,
-                )
-            ]
+    def _check_limit_alerts(self):
+        daily_limit = self.tracker.get_daily_limit()
+        weekly_limit = self.tracker.get_weekly_limit()
+        today_usage = self._today_usage_minutes()
+        week_usage = self._week_usage_minutes()
 
-        task_list.controls = rows
-        page.update()
+        if self.active_session_started_at is not None:
+            if today_usage >= daily_limit or week_usage >= weekly_limit:
+                self.stop_session(force_stop=True)
+                self._notify("ゲーム時間の上限に達しました", "本日のゲーム時間または今週の上限に達したため、ゲームを終了しました。")
+                self.locked_notification_sent = True
+                return
 
-    for key, label in (("all", "すべて"), ("active", "未完了"), ("done", "完了")):
-        filter_buttons[key] = ft.TextButton(
-            label,
-            on_click=lambda event, value=key: set_filter(value),
-        )
+        if daily_limit > 0 and today_usage >= daily_limit * 0.8 and "daily_80" not in self.warning_sent:
+            self.warning_sent.add("daily_80")
+            self._notify("残り少なくなりました", "今日のゲーム時間が80%に達しました。残り時間を確認してください。")
 
-    today_text = ft.Text(
-        today.strftime("%Y年%m月%d日"),
-        size=12,
-        color=MUTED,
-    )
-    composer = ft.Row(
-        [
-            task_input,
-            ft.Button(
-                "追加  ＋",
-                on_click=add_task,
-                bgcolor=GREEN,
-                color="white",
-                height=48,
-                style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=5)),
-            ),
-        ],
-        spacing=10,
-    )
+        if weekly_limit > 0 and week_usage >= weekly_limit * 0.8 and "weekly_80" not in self.warning_sent:
+            self.warning_sent.add("weekly_80")
+            self._notify("今週の上限が近づいています", "今週のゲーム時間が80%を超えました。節制してください。")
 
-    content = ft.Column(
-        [
-            ft.Row(
-                [
-                    ft.Row(
-                        [
-                            ft.Container(
-                                content=ft.Text("日", color="white", size=15, weight=ft.FontWeight.BOLD),
-                                width=28,
-                                height=28,
-                                bgcolor=GREEN,
-                                border_radius=14,
-                                alignment=ft.Alignment.CENTER,
-                            ),
-                            ft.Text("DAILY NOTE", size=12, color=GREEN, weight=ft.FontWeight.BOLD),
-                        ],
-                        spacing=10,
-                    ),
-                    today_text,
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            ),
-            ft.Column(
-                [
-                    ft.Text("今日の段取り", size=38, color=INK, weight=ft.FontWeight.W_600),
-                    ft.Text("ひとつずつ、進めていこう。", size=13, color=MUTED),
-                ],
-                spacing=4,
-            ),
-            ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Container(
-                            content=ft.Row(
-                                [
-                                    ft.Column(
-                                        [
-                                            ft.Text("ゲーム時間", size=22, weight=ft.FontWeight.BOLD, color=INK),
-                                            timer_status,
-                                            remaining_text,
-                                        ],
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                        expand=True,
-                                    ),
-                                    ft.Column(
-                                        [
-                                            limit_hours,
-                                            ft.Button("上限を保存", on_click=apply_limit, height=40),
-                                            timer_button,
-                                        ],
-                                        horizontal_alignment=ft.CrossAxisAlignment.END,
-                                        spacing=8,
-                                    ),
-                                ],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            padding=18,
-                            bgcolor=GREEN_LIGHT,
-                        ),
-                        ft.Container(content=composer, padding=18),
-                        ft.Container(
-                            content=ft.Row(
-                                [ft.Row(list(filter_buttons.values()), spacing=0), task_count],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(bottom=ft.BorderSide(1, "#DEDFD5")),
-                        ),
-                        ft.Container(content=task_list, padding=ft.Padding.symmetric(horizontal=18)),
-                        ft.Container(
-                            content=ft.Row(
-                                [progress_label, clear_done_button],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            padding=ft.Padding(left=18, right=18, top=8, bottom=8),
-                            border=ft.Border.only(top=ft.BorderSide(1, "#DEDFD5")),
-                        ),
-                    ],
-                    spacing=0,
-                ),
-                width=700,
-                bgcolor="#FFFEFA",
-                border=ft.Border.all(1, "#E3E3D9"),
-                border_radius=8,
-                shadow=ft.BoxShadow(blur_radius=28, color="#182D2314", offset=ft.Offset(0, 10)),
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            ),
-        ],
-        width=700,
-        spacing=28,
-    )
+    def start_session(self):
+        today = date.today().isoformat()
+        if self.active_session_started_at is not None:
+            return
 
-    app_container = ft.Container(content=content, width=700, padding=ft.Padding.only(top=18, bottom=32))
-    workspace_card = content.controls[2]
+        if self.tracker.is_daily_locked(today) or self.tracker.is_weekly_locked(today):
+            self.message_var.set("今日の制限に達したため、これ以上は開始できません。")
+            self._notify("制限中", "今日のゲーム時間上限に達したため、新しいゲーム開始はできません。")
+            return
 
-    def resize_page(event):
-        viewport_width = page.width or 748
-        page.padding = 12 if viewport_width < 520 else 24
-        content_width = min(700, max(272, viewport_width - page.padding * 2))
-        app_container.width = content_width
-        content.width = content_width
-        workspace_card.width = content_width
-        page.update()
+        self.active_session_started_at = time.time()
+        self.active_session_date = today
+        self.message_var.set("ゲーム中です。制限時間の管理を続けています。")
+        self.status_label.configure(text="ゲーム中", foreground="#15803d")
+        self.refresh_all()
 
-    page.on_resize = resize_page
-    timer_button.on_click = toggle_timer
-    page.add(app_container)
-    render()
-    refresh_timer()
-    page.run_task(update_timer)
+    def stop_session(self, force_stop=False):
+        if self.active_session_started_at is None:
+            return
+
+        elapsed_minutes = self._current_active_minutes()
+        if elapsed_minutes > 0:
+            self.tracker.log_session(self.active_session_date, elapsed_minutes)
+
+        self.active_session_started_at = None
+        self.warning_sent.clear()
+        self.locked_notification_sent = False
+
+        if force_stop:
+            self.message_var.set("上限に達したため、ゲームを自動終了しました。")
+        else:
+            self.message_var.set("ゲームを終了しました。次のセッションも計画的に使いましょう。")
+
+        self.refresh_all()
+
+    def refresh_all(self):
+        today = date.today().isoformat()
+        today_usage = self._today_usage_minutes()
+        week_usage = self._week_usage_minutes()
+
+        daily_limit = self.tracker.get_daily_limit()
+        weekly_limit = self.tracker.get_weekly_limit()
+
+        remaining = max(daily_limit - today_usage, 0)
+        remaining_week = max(weekly_limit - week_usage, 0)
+
+        self.today_usage_label.configure(text=format_duration(today_usage * 60))
+        self.week_usage_label.configure(text=format_duration(week_usage * 60))
+        self.remaining_label.configure(text=f"残り: {format_duration(remaining * 60)}")
+
+        if self.active_session_started_at is not None:
+            self.status_label.configure(text="ゲーム中", foreground="#15803d")
+            self.start_button.state(["disabled"])
+            self.stop_button.state(["!disabled"])
+        else:
+            self.status_label.configure(text="待機中", foreground="#1d4ed8")
+            self.start_button.state(["!disabled"])
+            self.stop_button.state(["disabled"])
+
+        if today_usage >= daily_limit or week_usage >= weekly_limit:
+            self.status_label.configure(text="制限終了", foreground="#b91c1c")
+            self.message_var.set("本日のまたは今週の制限時間を超えたため、今はゲームできません。")
+            self.start_button.state(["disabled"])
+            self.stop_button.state(["!disabled"])
+
+        self._render_chart()
+
+    def _render_chart(self):
+        data = self.tracker.get_last_7_days_usage()
+        if Figure is None or FigureCanvasTkAgg is None:
+            ttk.Label(self.graph_container, text="グラフ表示のために matplotlib が必要です。").pack(anchor="center")
+            return
+
+        for child in self.graph_container.winfo_children():
+            child.destroy()
+
+        fig = Figure(figsize=(8, 3.6), dpi=100)
+        ax = fig.add_subplot(111)
+        dates = [item["date"][-2:] for item in data]
+        values = [item["usage"] for item in data]
+        ax.bar(dates, values, color="#60a5fa", alpha=0.8)
+        ax.set_title("7日間のゲーム時間（分）")
+        ax.set_ylabel("分")
+        ax.set_ylim(0, max(120, max(values, default=0) + 30))
+        ax.grid(True, linestyle="--", alpha=0.35)
+
+        canvas = FigureCanvasTkAgg(fig, master=self.graph_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _tick(self):
+        self._check_limit_alerts()
+        self.refresh_all()
+        self.root.after(1000, self._tick)
+
+
+def main():
+    if tk is None:
+        raise RuntimeError("Tkinter is not available in this environment.")
+
+    root = tk.Tk()
+    app = GameTimeManagerApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    ft.run(main, view=ft.AppView.WEB_BROWSER)
+    main()
