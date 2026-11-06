@@ -1,4 +1,7 @@
+import asyncio
 import json
+import time
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
@@ -6,6 +9,7 @@ import flet as ft
 
 
 DATA_FILE = Path.home() / ".daily_note_tasks.json"
+GAME_TIMER_FILE = Path.home() / ".game_time_limit.json"
 GREEN = "#2E6654"
 GREEN_LIGHT = "#E2EDE5"
 PAPER = "#F6F5EF"
@@ -35,6 +39,35 @@ def save_tasks(tasks):
     DATA_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_timer_state():
+    try:
+        state = json.loads(GAME_TIMER_FILE.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            return {
+                "date": str(state.get("date", "")),
+                "limit_seconds": max(60, int(state.get("limit_seconds", 3600))),
+                "elapsed_seconds": max(0, int(state.get("elapsed_seconds", 0))),
+                "started_at": max(0.0, float(state.get("started_at", 0))),
+            }
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {"date": "", "limit_seconds": 3600, "elapsed_seconds": 0, "started_at": 0}
+
+
+def save_timer_state(state):
+    try:
+        GAME_TIMER_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
+
 def main(page: ft.Page):
     page.title = "今日の段取り | ToDo"
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -45,6 +78,110 @@ def main(page: ft.Page):
 
     tasks = load_tasks()
     current_filter = "all"
+
+    today = date.today()
+    timer_state = load_timer_state()
+    if timer_state["date"] != today.isoformat():
+        timer_state = {
+            "date": today.isoformat(),
+            "limit_seconds": timer_state["limit_seconds"],
+            "elapsed_seconds": 0,
+            "started_at": 0,
+        }
+        save_timer_state(timer_state)
+
+    timer_running = timer_state["started_at"] > 0
+    limit_hours = ft.TextField(
+        label="1日の上限（時間）",
+        value=str(timer_state["limit_seconds"] / 3600),
+        width=180,
+        input_filter=ft.NumbersOnlyInputFilter(),
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    remaining_text = ft.Text(size=44, weight=ft.FontWeight.BOLD, color=INK)
+    timer_status = ft.Text(size=12, color=MUTED)
+    timer_button = ft.Button(
+        "ゲーム開始",
+        width=140,
+        height=44,
+        bgcolor=GREEN,
+        color="white",
+        on_click=lambda event: toggle_timer(event),
+    )
+
+    def current_elapsed():
+        elapsed = timer_state["elapsed_seconds"]
+        if timer_state["started_at"]:
+            elapsed += max(0, time.time() - timer_state["started_at"])
+        return min(elapsed, timer_state["limit_seconds"])
+
+    def refresh_timer():
+        nonlocal timer_running
+        if timer_state["date"] != date.today().isoformat():
+            timer_state.update(
+                date=date.today().isoformat(),
+                limit_seconds=timer_state["limit_seconds"],
+                elapsed_seconds=0,
+                started_at=0,
+            )
+            save_timer_state(timer_state)
+
+        elapsed = current_elapsed()
+        remaining = timer_state["limit_seconds"] - elapsed
+        timer_running = timer_state["started_at"] > 0
+        remaining_text.value = format_duration(remaining)
+        timer_status.value = "残り時間" if timer_running else "停止中"
+        timer_button.text = "停止" if timer_running else "ゲーム開始"
+        timer_button.bgcolor = CORAL if timer_running else GREEN
+        timer_button.color = "white"
+
+        if remaining <= 0:
+            timer_state["elapsed_seconds"] = timer_state["limit_seconds"]
+            timer_state["started_at"] = 0
+            timer_running = False
+            timer_status.value = "今日の上限に到達"
+            timer_button.text = "リセット"
+            timer_button.bgcolor = GREEN
+            save_timer_state(timer_state)
+        page.update()
+
+    def apply_limit(event):
+        try:
+            hours = float(limit_hours.value)
+            if not 0.25 <= hours <= 24:
+                raise ValueError
+        except (TypeError, ValueError):
+            timer_status.value = "0.25〜24時間で入力してください"
+            page.update()
+            return
+
+        elapsed = current_elapsed()
+        timer_state["limit_seconds"] = int(hours * 3600)
+        timer_state["elapsed_seconds"] = min(int(elapsed), timer_state["limit_seconds"])
+        timer_state["started_at"] = time.time() if timer_running else 0
+        save_timer_state(timer_state)
+        refresh_timer()
+
+    def toggle_timer(event):
+        if current_elapsed() >= timer_state["limit_seconds"]:
+            timer_state["elapsed_seconds"] = 0
+            timer_state["started_at"] = 0
+            save_timer_state(timer_state)
+            refresh_timer()
+            return
+
+        if timer_state["started_at"]:
+            timer_state["elapsed_seconds"] = int(current_elapsed())
+            timer_state["started_at"] = 0
+        else:
+            timer_state["started_at"] = time.time()
+        save_timer_state(timer_state)
+        refresh_timer()
+
+    async def update_timer():
+        while True:
+            await asyncio.sleep(1)
+            refresh_timer()
 
     task_input = ft.TextField(
         hint_text="次にやることは？",
@@ -190,8 +327,8 @@ def main(page: ft.Page):
             on_click=lambda event, value=key: set_filter(value),
         )
 
-    today = ft.Text(
-        __import__("datetime").date.today().strftime("%Y年%m月%d日"),
+    today_text = ft.Text(
+        today.strftime("%Y年%m月%d日"),
         size=12,
         color=MUTED,
     )
@@ -228,7 +365,7 @@ def main(page: ft.Page):
                         ],
                         spacing=10,
                     ),
-                    today,
+                    today_text,
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
@@ -242,7 +379,35 @@ def main(page: ft.Page):
             ft.Container(
                 content=ft.Column(
                     [
-                        ft.Container(content=composer, padding=18, bgcolor=GREEN_LIGHT),
+                        ft.Container(
+                            content=ft.Row(
+                                [
+                                    ft.Column(
+                                        [
+                                            ft.Text("ゲーム時間", size=22, weight=ft.FontWeight.BOLD, color=INK),
+                                            timer_status,
+                                            remaining_text,
+                                        ],
+                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                        expand=True,
+                                    ),
+                                    ft.Column(
+                                        [
+                                            limit_hours,
+                                            ft.Button("上限を保存", on_click=apply_limit, height=40),
+                                            timer_button,
+                                        ],
+                                        horizontal_alignment=ft.CrossAxisAlignment.END,
+                                        spacing=8,
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            padding=18,
+                            bgcolor=GREEN_LIGHT,
+                        ),
+                        ft.Container(content=composer, padding=18),
                         ft.Container(
                             content=ft.Row(
                                 [ft.Row(list(filter_buttons.values()), spacing=0), task_count],
@@ -289,8 +454,11 @@ def main(page: ft.Page):
         page.update()
 
     page.on_resize = resize_page
+    timer_button.on_click = toggle_timer
     page.add(app_container)
     render()
+    refresh_timer()
+    page.run_task(update_timer)
 
 
 if __name__ == "__main__":
