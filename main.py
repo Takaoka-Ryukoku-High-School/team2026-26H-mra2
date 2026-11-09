@@ -1,8 +1,15 @@
+import csv
+import io
+import argparse
 import json
+import math
+import os
+import re
 import sqlite3
 import subprocess
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 try:
@@ -60,9 +67,20 @@ class GameUsageTracker:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_date TEXT NOT NULL,
                 minutes INTEGER NOT NULL,
+                seconds INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
+        )
+        columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "seconds" not in columns:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN seconds INTEGER NOT NULL DEFAULT 0"
+            )
+        self.conn.execute(
+            "UPDATE sessions SET seconds = minutes * 60 WHERE seconds = 0 AND minutes > 0"
         )
         self.conn.commit()
 
@@ -90,6 +108,77 @@ class GameUsageTracker:
         self._save_limit("daily_minutes", max(0, int(daily_minutes)))
         self._save_limit("weekly_minutes", max(0, int(weekly_minutes)))
 
+    def get_weekday_limits(self):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = 'weekday_limits'"
+        ).fetchone()
+        if row is not None:
+            try:
+                limits = json.loads(row["value"])
+                if (
+                    isinstance(limits, list)
+                    and len(limits) == 5
+                    and all(isinstance(value, int) and 0 <= value <= 1440 for value in limits)
+                ):
+                    return limits
+            except (TypeError, ValueError):
+                pass
+        return [self.get_daily_limit()] * 5
+
+    def set_weekday_limits(self, limits):
+        if (
+            not isinstance(limits, list)
+            or len(limits) != 5
+            or any(not isinstance(value, int) or not 0 <= value <= 1440 for value in limits)
+        ):
+            raise ValueError("月曜日から金曜日までの上限を、0〜24時間の整数分で設定してください。")
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES('weekday_limits', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(limits),),
+        )
+        self.conn.commit()
+
+    def get_process_names(self):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = 'process_names'"
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            names = json.loads(row["value"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("保存されたゲーム名の設定を読み込めません。") from error
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("保存されたゲーム名の設定が正しくありません。")
+        return names
+
+    def set_process_names(self, names):
+        if not isinstance(names, list) or len(names) > 50:
+            raise ValueError("ゲーム名は50個以内で設定してください。")
+        normalized = []
+        for name in names:
+            if not isinstance(name, str):
+                raise ValueError("ゲーム名は文字列で入力してください。")
+            name = name.strip()
+            if (
+                not name
+                or len(name) > 128
+                or "/" in name
+                or "\\" in name
+                or any(ord(character) < 32 for character in name)
+            ):
+                raise ValueError("ゲーム名には実行ファイル名のみを入力してください（例: game.exe）。")
+            folded_name = name.casefold()
+            if folded_name not in {existing.casefold() for existing in normalized}:
+                normalized.append(name)
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES('process_names', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(normalized, ensure_ascii=False),),
+        )
+        self.conn.commit()
+
     def get_daily_limit(self):
         return self.get_limit("daily_minutes", 120)
 
@@ -100,26 +189,38 @@ class GameUsageTracker:
         minutes = max(0, int(minutes))
         if minutes <= 0:
             return
+        self.log_session_seconds(session_date, minutes * 60)
+
+    def log_session_seconds(self, session_date, seconds):
+        seconds = max(0, int(seconds))
+        if seconds <= 0:
+            return
         self.conn.execute(
-            "INSERT INTO sessions(session_date, minutes, created_at) VALUES (?, ?, ?)",
-            (session_date, minutes, datetime.now().isoformat(timespec="seconds")),
+            "INSERT INTO sessions(session_date, minutes, seconds, created_at) VALUES (?, ?, ?, ?)",
+            (session_date, seconds // 60, seconds, datetime.now().isoformat(timespec="seconds")),
         )
         self.conn.commit()
 
     def get_daily_usage(self, session_date=None):
+        return self.get_daily_usage_seconds(session_date) // 60
+
+    def get_daily_usage_seconds(self, session_date=None):
         target_date = (session_date or date.today().isoformat())
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(minutes), 0) AS total FROM sessions WHERE session_date = ?",
+            "SELECT COALESCE(SUM(seconds), 0) AS total FROM sessions WHERE session_date = ?",
             (target_date,),
         ).fetchone()
         return int(row["total"]) if row else 0
 
     def get_week_usage(self, session_date=None):
+        return self.get_week_usage_seconds(session_date) // 60
+
+    def get_week_usage_seconds(self, session_date=None):
         target_date = date.fromisoformat(session_date or date.today().isoformat())
         start_of_week = target_date - timedelta(days=target_date.weekday())
         end_of_week = start_of_week + timedelta(days=6)
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(minutes), 0) AS total FROM sessions WHERE session_date BETWEEN ? AND ?",
+            "SELECT COALESCE(SUM(seconds), 0) AS total FROM sessions WHERE session_date BETWEEN ? AND ?",
             (start_of_week.isoformat(), end_of_week.isoformat()),
         ).fetchone()
         return int(row["total"]) if row else 0
@@ -145,6 +246,336 @@ class GameUsageTracker:
             d = today - timedelta(days=offset)
             history.append({"date": d.isoformat(), "usage": self.get_daily_usage(d.isoformat())})
         return history
+
+
+class WebGameTimeManager:
+    """Session and limit management for the browser interface."""
+
+    def __init__(self, tracker=None):
+        self.tracker = tracker or GameUsageTracker()
+        self.active_session_started_at = None
+        self.active_session_date = date.today().isoformat()
+        self.message = "制限内で使えます。"
+
+    def _active_minutes(self):
+        if self.active_session_started_at is None:
+            return 0
+        return max(0, int((time.time() - self.active_session_started_at) / 60))
+
+    def stop_session(self, force_stop=False):
+        if self.active_session_started_at is None:
+            return False
+        elapsed_minutes = self._active_minutes()
+        if elapsed_minutes:
+            self.tracker.log_session(self.active_session_date, elapsed_minutes)
+        self.active_session_started_at = None
+        self.message = (
+            "上限に達したため、ゲームを自動終了しました。"
+            if force_stop
+            else "ゲームを終了しました。次のセッションも計画的に使いましょう。"
+        )
+        return True
+
+    def enforce_limits(self):
+        if self.active_session_started_at is None:
+            return
+        today = date.today().isoformat()
+        active_minutes = self._active_minutes()
+        if (
+            self.tracker.get_daily_usage(today) + active_minutes >= self.tracker.get_daily_limit()
+            or self.tracker.get_week_usage(today) + active_minutes >= self.tracker.get_weekly_limit()
+        ):
+            self.stop_session(force_stop=True)
+
+    def start_session(self):
+        self.enforce_limits()
+        if self.active_session_started_at is not None:
+            return False, "すでにゲーム中です。"
+
+        today = date.today().isoformat()
+        if self.tracker.is_daily_locked(today) or self.tracker.is_weekly_locked(today):
+            self.message = "今日または今週の制限に達したため、ゲームを開始できません。"
+            return False, self.message
+
+        self.active_session_started_at = time.time()
+        self.active_session_date = today
+        self.message = "ゲーム中です。制限時間の管理を続けています。"
+        return True, self.message
+
+    def save_limits(self, daily_hours, weekly_hours):
+        daily_hours = float(daily_hours)
+        weekly_hours = float(weekly_hours)
+        if not (
+            math.isfinite(daily_hours)
+            and math.isfinite(weekly_hours)
+            and 0 < daily_hours <= 24
+            and 0 < weekly_hours <= 24 * 7
+        ):
+            raise ValueError("1日の上限は0より大きく24時間以下、1週間の上限は0より大きく168時間以下で設定してください。")
+        self.tracker.set_limits(int(daily_hours * 60), int(weekly_hours * 60))
+        self.enforce_limits()
+        self.message = "制限を保存しました。"
+
+    def get_status(self):
+        self.enforce_limits()
+        today = date.today().isoformat()
+        active_minutes = self._active_minutes()
+        daily_limit = self.tracker.get_daily_limit()
+        weekly_limit = self.tracker.get_weekly_limit()
+        daily_usage = self.tracker.get_daily_usage(today) + active_minutes
+        weekly_usage = self.tracker.get_week_usage(today) + active_minutes
+        locked = daily_usage >= daily_limit or weekly_usage >= weekly_limit
+        state = "ゲーム中" if self.active_session_started_at is not None else ("制限中" if locked else "待機中")
+        message = self.message
+        if locked and self.active_session_started_at is None:
+            message = "本日または今週の上限に達したため、今はゲームを開始できません。"
+        elif not locked and (
+            daily_usage >= daily_limit * 0.8 or weekly_usage >= weekly_limit * 0.8
+        ):
+            message = "使用時間が上限の80%に達しました。残り時間を確認してください。"
+        history = self.tracker.get_last_7_days_usage()
+        if self.active_session_started_at is not None:
+            for item in history:
+                if item["date"] == today:
+                    item["usage"] += active_minutes
+                    break
+        return {
+            "state": state,
+            "message": message,
+            "active": self.active_session_started_at is not None,
+            "can_start": not locked and self.active_session_started_at is None,
+            "daily_usage": daily_usage,
+            "weekly_usage": weekly_usage,
+            "daily_limit": daily_limit,
+            "weekly_limit": weekly_limit,
+            "daily_remaining": max(0, daily_limit - daily_usage),
+            "weekly_remaining": max(0, weekly_limit - weekly_usage),
+            "history": history,
+        }
+
+
+PAGE = """<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Game Time Manager</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172033; background: #f3f6fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 32px 16px; }
+    main { max-width: 900px; margin: auto; }
+    h1 { margin: 0 0 6px; font-size: clamp(1.5rem, 4vw, 2rem); }
+    .subtitle { margin: 0 0 24px; color: #64748b; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .card { padding: 22px; background: white; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0 4px 16px #0f172a0a; }
+    h2 { margin: 0 0 16px; font-size: 1.1rem; }
+    .state { margin: 0 0 6px; font-weight: 700; font-size: 1.5rem; }
+    .state[data-state="ゲーム中"] { color: #15803d; }
+    .state[data-state="制限中"] { color: #b91c1c; }
+    .state[data-state="待機中"] { color: #1d4ed8; }
+    .message { min-height: 3em; color: #475569; }
+    .stats { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin: 18px 0; }
+    .stats strong { font-variant-numeric: tabular-nums; }
+    button { border: 0; border-radius: 9px; padding: 11px 16px; font: inherit; font-weight: 650; color: white; background: #2563eb; cursor: pointer; }
+    button.stop { background: #475569; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .buttons { display: flex; gap: 10px; }
+    label { display: block; margin: 0 0 14px; color: #475569; font-size: .92rem; }
+    input { display: block; width: 100%; margin-top: 6px; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
+    .chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 12px; height: 190px; padding-top: 10px; }
+    .day { display: flex; flex-direction: column; justify-content: end; align-items: center; gap: 7px; height: 100%; color: #64748b; font-size: .8rem; }
+    .bar-wrap { display: flex; align-items: end; width: 100%; height: 140px; }
+    .bar { width: 100%; min-height: 2px; border-radius: 6px 6px 0 0; background: #60a5fa; }
+    .notice { margin-top: 12px; color: #b91c1c; min-height: 1.4em; }
+    @media (max-width: 480px) { body { padding: 20px 12px; } .card { padding: 17px; } .chart { gap: 6px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>ゲーム時間マネージャー</h1>
+  <p class="subtitle">ゲームの使用時間を記録し、決めた上限を守りましょう。</p>
+  <div class="grid">
+    <section class="card">
+      <h2>現在の状態</h2>
+      <p class="state" id="state">読み込み中</p>
+      <p class="message" id="message" aria-live="polite"></p>
+      <div class="stats">
+        <span>今日の使用時間</span><strong id="daily-usage">--</strong>
+        <span>今日の残り時間</span><strong id="daily-remaining">--</strong>
+        <span>今週の使用時間</span><strong id="weekly-usage">--</strong>
+        <span>今週の残り時間</span><strong id="weekly-remaining">--</strong>
+      </div>
+      <div class="buttons">
+        <button id="start" type="button" onclick="sessionAction('start')">ゲーム開始</button>
+        <button class="stop" id="stop" type="button" onclick="sessionAction('stop')">ゲーム終了</button>
+      </div>
+      <p class="notice" id="notice" role="alert"></p>
+    </section>
+    <section class="card">
+      <h2>制限設定</h2>
+      <form id="limits-form">
+        <label>1日の上限（時間）<input id="daily-limit" type="number" min="0.1" max="24" step="0.1" required></label>
+        <label>1週間の上限（時間）<input id="weekly-limit" type="number" min="0.1" max="168" step="0.1" required></label>
+        <button type="submit">制限を保存</button>
+      </form>
+    </section>
+  </div>
+  <section class="card" style="margin-top:16px">
+    <h2>過去7日間の使用量（分）</h2>
+    <div class="chart" id="chart" aria-label="過去7日間の使用量グラフ"></div>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const formatMinutes = (minutes) => {
+    const seconds = Math.max(0, Math.floor(minutes * 60));
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    return [hours, mins, secs].map((n) => String(n).padStart(2, '0')).join(':');
+  };
+  async function request(path, data) {
+    const response = await fetch(path, {
+      method: data ? 'POST' : 'GET',
+      headers: data ? { 'Content-Type': 'application/json' } : {},
+      body: data ? JSON.stringify(data) : undefined
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'リクエストに失敗しました。');
+    return result;
+  }
+  function drawChart(history) {
+    const chart = $('chart');
+    chart.replaceChildren();
+    const max = Math.max(60, ...history.map((item) => item.usage));
+    for (const item of history) {
+      const day = document.createElement('div');
+      day.className = 'day';
+      const value = document.createElement('span');
+      value.textContent = String(item.usage);
+      const wrap = document.createElement('div');
+      wrap.className = 'bar-wrap';
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.height = `${Math.max(2, Math.min(100, item.usage / max * 100))}%`;
+      wrap.append(bar);
+      const label = document.createElement('span');
+      label.textContent = item.date.slice(5);
+      day.append(value, wrap, label);
+      chart.append(day);
+    }
+  }
+  async function refresh() {
+    try {
+      const data = await request('/api/status');
+      $('state').textContent = data.state;
+      $('state').dataset.state = data.state;
+      $('message').textContent = data.message;
+      $('daily-usage').textContent = `${formatMinutes(data.daily_usage)} / ${formatMinutes(data.daily_limit)}`;
+      $('daily-remaining').textContent = formatMinutes(data.daily_remaining);
+      $('weekly-usage').textContent = `${formatMinutes(data.weekly_usage)} / ${formatMinutes(data.weekly_limit)}`;
+      $('weekly-remaining').textContent = formatMinutes(data.weekly_remaining);
+      $('start').disabled = !data.can_start;
+      $('stop').disabled = !data.active;
+      if (document.activeElement !== $('daily-limit')) $('daily-limit').value = (data.daily_limit / 60).toFixed(1);
+      if (document.activeElement !== $('weekly-limit')) $('weekly-limit').value = (data.weekly_limit / 60).toFixed(1);
+      drawChart(data.history);
+    } catch (error) {
+      $('notice').textContent = error.message;
+    }
+  }
+  async function sessionAction(action) {
+    $('notice').textContent = '';
+    try {
+      const result = await request(`/api/${action}`, {});
+      $('message').textContent = result.message;
+      await refresh();
+    } catch (error) {
+      $('notice').textContent = error.message;
+    }
+  }
+  $('limits-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('notice').textContent = '';
+    try {
+      const result = await request('/api/limits', {
+        daily_hours: $('daily-limit').value,
+        weekly_hours: $('weekly-limit').value
+      });
+      $('message').textContent = result.message;
+      await refresh();
+    } catch (error) {
+      $('notice').textContent = error.message;
+    }
+  });
+  refresh();
+  setInterval(refresh, 1000);
+</script>
+</body>
+</html>"""
+
+
+class GameTimeHTTPServer(HTTPServer):
+    def __init__(self, server_address, manager):
+        self.manager = manager
+        super().__init__(server_address, GameTimeRequestHandler)
+
+    def service_actions(self):
+        self.manager.enforce_limits()
+
+
+class GameTimeRequestHandler(BaseHTTPRequestHandler):
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/":
+            body = PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/status":
+            self._send_json(self.server.manager.get_status())
+        else:
+            self._send_json({"error": "ページが見つかりません。"}, 404)
+
+    def do_POST(self):
+        if self.path not in {"/api/start", "/api/stop", "/api/limits"}:
+            self._send_json({"error": "ページが見つかりません。"}, 404)
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > 10_000:
+                raise ValueError("リクエストの内容を確認してください。")
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("リクエストの内容を確認してください。")
+            manager = self.server.manager
+            if self.path == "/api/start":
+                success, message = manager.start_session()
+                self._send_json({"success": success, "message": message}, 200 if success else 409)
+            elif self.path == "/api/stop":
+                if not manager.stop_session():
+                    self._send_json({"error": "ゲームセッションは開始されていません。"}, 409)
+                    return
+                self._send_json({"success": True, "message": manager.message})
+            else:
+                manager.save_limits(payload.get("daily_hours"), payload.get("weekly_hours"))
+                self._send_json({"success": True, "message": manager.message})
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            self._send_json({"error": str(error) or "入力値を確認してください。"}, 400)
+
+    def log_message(self, format_string, *args):
+        print(f"{self.address_string()} - {format_string % args}")
 
 
 class GameTimeManagerApp:
@@ -392,12 +823,29 @@ class GameTimeManagerApp:
 
 
 def main():
-    if tk is None:
-        raise RuntimeError("Tkinter is not available in this environment.")
+    parser = argparse.ArgumentParser(description="ゲーム時間マネージャー")
+    parser.add_argument("--gui", action="store_true", help="従来のデスクトップ画面で起動")
+    parser.add_argument("--host", default="127.0.0.1", help="Webサーバーの接続先 (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Webサーバーのポート (default: 8000)")
+    args = parser.parse_args()
 
-    root = tk.Tk()
-    app = GameTimeManagerApp(root)
-    root.mainloop()
+    if args.gui:
+        if tk is None:
+            raise RuntimeError("Tkinter is not available in this environment.")
+        root = tk.Tk()
+        app = GameTimeManagerApp(root)
+        root.mainloop()
+        return
+
+    manager = WebGameTimeManager()
+    server = GameTimeHTTPServer((args.host, args.port), manager)
+    print(f"ブラウザで開いてください: http://{args.host}:{args.port}/")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nサーバーを終了します。")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
