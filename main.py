@@ -1,13 +1,15 @@
+import argparse
 import csv
 import io
-import argparse
 import json
+import locale
 import math
 import os
 import re
 import sqlite3
 import subprocess
 import time
+import webbrowser
 from datetime import date, datetime, time as datetime_time, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -31,6 +33,7 @@ except Exception:  # pragma: no cover - handled gracefully if matplotlib is miss
 APP_DIR = Path.home() / ".game_time_manager"
 DB_PATH = APP_DIR / "game_usage.db"
 CONFIG_PATH = APP_DIR / "config.json"
+NOTIFICATION_TONES = {"chime", "bell", "soft"}
 
 
 def format_duration(total_seconds):
@@ -179,6 +182,38 @@ class GameUsageTracker:
         )
         self.conn.commit()
 
+    def get_notification_settings(self):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = 'notification_settings'"
+        ).fetchone()
+        if row is None:
+            return {"tone": "chime", "volume": 50}
+        try:
+            settings = json.loads(row["value"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("保存された通知音設定を読み込めません。") from error
+        if (
+            not isinstance(settings, dict)
+            or not isinstance(settings.get("tone"), str)
+            or settings["tone"] not in NOTIFICATION_TONES
+            or type(settings.get("volume")) is not int
+            or not 0 <= settings["volume"] <= 100
+        ):
+            raise ValueError("保存された通知音設定が正しくありません。")
+        return settings
+
+    def set_notification_settings(self, tone, volume):
+        if not isinstance(tone, str) or tone not in NOTIFICATION_TONES:
+            raise ValueError("通知音を選択してください。")
+        if type(volume) is not int or not 0 <= volume <= 100:
+            raise ValueError("通知音の音量は0〜100で設定してください。")
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES('notification_settings', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps({"tone": tone, "volume": volume}),),
+        )
+        self.conn.commit()
+
     def get_daily_limit(self):
         return self.get_limit("daily_minutes", 120)
 
@@ -247,111 +282,172 @@ class GameUsageTracker:
             history.append({"date": d.isoformat(), "usage": self.get_daily_usage(d.isoformat())})
         return history
 
+    def get_current_week_usage_by_day(self, session_date=None):
+        target_date = date.fromisoformat(session_date or date.today().isoformat())
+        monday = target_date - timedelta(days=target_date.weekday())
+        weekdays = ("月", "火", "水", "木", "金", "土", "日")
+        history = []
+        for offset, weekday in enumerate(weekdays):
+            day = monday + timedelta(days=offset)
+            history.append({
+                "date": day.isoformat(),
+                "weekday": weekday,
+                "usage": self.get_daily_usage_seconds(day.isoformat()) / 60,
+            })
+        return history
+
 
 class WebGameTimeManager:
-    """Session and limit management for the browser interface."""
+    """Track configured game processes and weekday usage limits."""
 
-    def __init__(self, tracker=None):
+    def __init__(self, tracker=None, process_provider=None):
         self.tracker = tracker or GameUsageTracker()
-        self.active_session_started_at = None
-        self.active_session_date = date.today().isoformat()
-        self.message = "制限内で使えます。"
+        self.process_provider = process_provider or self.get_running_processes
+        self.process_active = False
+        self.process_names = self.tracker.get_process_names()
+        self.last_checked_at = None
+        self.next_scan_at = 0
+        self.scan_interval = 3
+        self.monitor_error = None
 
-    def _active_minutes(self):
-        if self.active_session_started_at is None:
-            return 0
-        return max(0, int((time.time() - self.active_session_started_at) / 60))
-
-    def stop_session(self, force_stop=False):
-        if self.active_session_started_at is None:
-            return False
-        elapsed_minutes = self._active_minutes()
-        if elapsed_minutes:
-            self.tracker.log_session(self.active_session_date, elapsed_minutes)
-        self.active_session_started_at = None
-        self.message = (
-            "上限に達したため、ゲームを自動終了しました。"
-            if force_stop
-            else "ゲームを終了しました。次のセッションも計画的に使いましょう。"
+    @staticmethod
+    def get_running_processes():
+        if os.name != "nt":
+            raise RuntimeError("自動計測はWindows上でアプリを起動した場合に利用できます。")
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding=locale.getpreferredencoding(False),
+            errors="replace",
+            timeout=10,
         )
-        return True
+        return {
+            row[0].casefold()
+            for row in csv.reader(io.StringIO(result.stdout))
+            if row
+        }
 
-    def enforce_limits(self):
-        if self.active_session_started_at is None:
+    def _record_interval(self, start_timestamp, end_timestamp):
+        if end_timestamp <= start_timestamp:
             return
-        today = date.today().isoformat()
-        active_minutes = self._active_minutes()
-        if (
-            self.tracker.get_daily_usage(today) + active_minutes >= self.tracker.get_daily_limit()
-            or self.tracker.get_week_usage(today) + active_minutes >= self.tracker.get_weekly_limit()
-        ):
-            self.stop_session(force_stop=True)
+        cursor = datetime.fromtimestamp(start_timestamp)
+        end = datetime.fromtimestamp(end_timestamp)
+        while cursor.date() < end.date():
+            midnight = datetime.combine(cursor.date() + timedelta(days=1), datetime_time.min)
+            seconds = int((midnight - cursor).total_seconds())
+            self.tracker.log_session_seconds(cursor.date().isoformat(), seconds)
+            cursor = midnight
+        self.tracker.log_session_seconds(
+            cursor.date().isoformat(), int((end - cursor).total_seconds())
+        )
 
-    def start_session(self):
-        self.enforce_limits()
-        if self.active_session_started_at is not None:
-            return False, "すでにゲーム中です。"
+    def scan_processes(self, now=None, force=False):
+        monotonic_now = time.monotonic()
+        if not force and monotonic_now < self.next_scan_at:
+            return
+        self.next_scan_at = monotonic_now + self.scan_interval
+        now = time.time() if now is None else now
+        if not self.process_names:
+            if self.process_active and self.last_checked_at is not None:
+                self._record_interval(self.last_checked_at, now)
+            self.process_active = False
+            self.last_checked_at = None
+            self.monitor_error = None
+            return
+        try:
+            running = self.process_provider()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            self.monitor_error = str(error) or "ゲームのプロセスを確認できませんでした。"
+            return
 
-        today = date.today().isoformat()
-        if self.tracker.is_daily_locked(today) or self.tracker.is_weekly_locked(today):
-            self.message = "今日または今週の制限に達したため、ゲームを開始できません。"
-            return False, self.message
-
-        self.active_session_started_at = time.time()
-        self.active_session_date = today
-        self.message = "ゲーム中です。制限時間の管理を続けています。"
-        return True, self.message
-
-    def save_limits(self, daily_hours, weekly_hours):
-        daily_hours = float(daily_hours)
-        weekly_hours = float(weekly_hours)
-        if not (
-            math.isfinite(daily_hours)
-            and math.isfinite(weekly_hours)
-            and 0 < daily_hours <= 24
-            and 0 < weekly_hours <= 24 * 7
-        ):
-            raise ValueError("1日の上限は0より大きく24時間以下、1週間の上限は0より大きく168時間以下で設定してください。")
-        self.tracker.set_limits(int(daily_hours * 60), int(weekly_hours * 60))
-        self.enforce_limits()
-        self.message = "制限を保存しました。"
+        matched_names = {name.casefold() for name in self.process_names}
+        is_active = bool(matched_names.intersection(running))
+        if self.process_active and self.last_checked_at is not None:
+            self._record_interval(self.last_checked_at, now)
+        self.process_active = is_active
+        self.last_checked_at = now if is_active else None
+        self.monitor_error = None
 
     def get_status(self):
-        self.enforce_limits()
         today = date.today().isoformat()
-        active_minutes = self._active_minutes()
-        daily_limit = self.tracker.get_daily_limit()
-        weekly_limit = self.tracker.get_weekly_limit()
-        daily_usage = self.tracker.get_daily_usage(today) + active_minutes
-        weekly_usage = self.tracker.get_week_usage(today) + active_minutes
-        locked = daily_usage >= daily_limit or weekly_usage >= weekly_limit
-        state = "ゲーム中" if self.active_session_started_at is not None else ("制限中" if locked else "待機中")
-        message = self.message
-        if locked and self.active_session_started_at is None:
-            message = "本日または今週の上限に達したため、今はゲームを開始できません。"
-        elif not locked and (
-            daily_usage >= daily_limit * 0.8 or weekly_usage >= weekly_limit * 0.8
-        ):
-            message = "使用時間が上限の80%に達しました。残り時間を確認してください。"
-        history = self.tracker.get_last_7_days_usage()
-        if self.active_session_started_at is not None:
+        weekday = date.today().weekday()
+        daily_limit = self.tracker.get_weekday_limits()[weekday] if weekday < 5 else None
+        pending_seconds = (
+            max(0, int(time.time() - self.last_checked_at))
+            if self.process_active and self.last_checked_at is not None
+            else 0
+        )
+        daily_usage_seconds = self.tracker.get_daily_usage_seconds(today) + pending_seconds
+        weekly_usage_seconds = self.tracker.get_week_usage_seconds(today) + pending_seconds
+        daily_usage = daily_usage_seconds / 60
+        weekly_usage = weekly_usage_seconds / 60
+        daily_locked = daily_limit is not None and daily_usage_seconds >= daily_limit * 60
+        if self.monitor_error:
+            state = "計測できません"
+            message = self.monitor_error
+        elif not os.name == "nt":
+            state = "計測できません"
+            message = "自動計測はWindows上でアプリを起動した場合に利用できます。"
+        elif not self.process_names:
+            state = "ゲーム名未設定"
+            message = "計測するゲームの実行ファイル名を設定してください。"
+        elif self.process_active:
+            state = "上限超過中" if daily_locked else "自動計測中"
+            message = (
+                "今日の設定時間を超えています。ゲームは自動終了しないため、終了してください。"
+                if daily_locked
+                else "登録したゲームの使用時間を自動計測しています。"
+            )
+        else:
+            state = "上限到達" if daily_locked else "待機中"
+            message = "今日の設定時間に達しました。" if daily_locked else "登録したゲームが起動すると自動計測します。"
+        history = self.tracker.get_current_week_usage_by_day(today)
+        if self.process_active:
             for item in history:
                 if item["date"] == today:
-                    item["usage"] += active_minutes
+                    item["usage"] += pending_seconds / 60
                     break
         return {
             "state": state,
             "message": message,
-            "active": self.active_session_started_at is not None,
-            "can_start": not locked and self.active_session_started_at is None,
+            "active": self.process_active,
             "daily_usage": daily_usage,
             "weekly_usage": weekly_usage,
             "daily_limit": daily_limit,
-            "weekly_limit": weekly_limit,
-            "daily_remaining": max(0, daily_limit - daily_usage),
-            "weekly_remaining": max(0, weekly_limit - weekly_usage),
+            "daily_remaining": (
+                max(0, daily_limit * 60 - daily_usage_seconds) / 60
+                if daily_limit is not None
+                else None
+            ),
+            "weekday_limits": self.tracker.get_weekday_limits(),
+            "process_names": self.process_names,
+            "notification_settings": self.tracker.get_notification_settings(),
+            "today": today,
+            "monitor_supported": os.name == "nt",
             "history": history,
         }
+
+    def save_settings(self, weekday_hours, process_names):
+        if not isinstance(weekday_hours, list) or len(weekday_hours) != 5:
+            raise ValueError("月曜日から金曜日までの上限を設定してください。")
+        limits = []
+        for hours in weekday_hours:
+            value = float(hours)
+            if not math.isfinite(value) or not 0 <= value <= 24:
+                raise ValueError("曜日ごとの上限は0〜24時間で設定してください。")
+            limits.append(int(value * 60))
+        if not isinstance(process_names, list):
+            raise ValueError("ゲーム名の一覧を入力してください。")
+        self.tracker.set_process_names(process_names)
+        self.tracker.set_weekday_limits(limits)
+        self.process_names = self.tracker.get_process_names()
+        self.monitor_error = None
+        self.scan_processes(force=True)
+
+    def save_notification_settings(self, tone, volume):
+        self.tracker.set_notification_settings(tone, volume)
 
 
 PAGE = """<!doctype html>
@@ -370,22 +466,35 @@ PAGE = """<!doctype html>
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
     .card { padding: 22px; background: white; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0 4px 16px #0f172a0a; }
     h2 { margin: 0 0 16px; font-size: 1.1rem; }
+    .home-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-bottom: 16px; }
+    button.nav-card { display: flex; align-items: center; gap: 14px; width: 100%; min-height: 100px; padding: 18px; color: #172033; text-align: left; background: white; border: 1px solid #e2e8f0; box-shadow: 0 4px 16px #0f172a0a; }
+    .nav-icon { font-size: 1.8rem; }
+    .nav-card strong, .nav-card small { display: block; }
+    .nav-card small { margin-top: 5px; color: #64748b; font-weight: 400; }
+    .view-heading { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+    .view-heading h2 { margin: 0; }
+    .back-button, .secondary-button { color: #334155; background: #e2e8f0; }
+    .view[hidden] { display: none; }
     .state { margin: 0 0 6px; font-weight: 700; font-size: 1.5rem; }
-    .state[data-state="ゲーム中"] { color: #15803d; }
-    .state[data-state="制限中"] { color: #b91c1c; }
+    .state[data-state="自動計測中"] { color: #15803d; }
+    .state[data-state="上限超過中"], .state[data-state="上限到達"], .state[data-state="計測できません"] { color: #b91c1c; }
     .state[data-state="待機中"] { color: #1d4ed8; }
     .message { min-height: 3em; color: #475569; }
     .stats { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin: 18px 0; }
     .stats strong { font-variant-numeric: tabular-nums; }
     button { border: 0; border-radius: 9px; padding: 11px 16px; font: inherit; font-weight: 650; color: white; background: #2563eb; cursor: pointer; }
-    button.stop { background: #475569; }
-    button:disabled { opacity: .45; cursor: not-allowed; }
-    .buttons { display: flex; gap: 10px; }
     label { display: block; margin: 0 0 14px; color: #475569; font-size: .92rem; }
     input { display: block; width: 100%; margin-top: 6px; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
-    .chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 12px; height: 190px; padding-top: 10px; }
-    .day { display: flex; flex-direction: column; justify-content: end; align-items: center; gap: 7px; height: 100%; color: #64748b; font-size: .8rem; }
-    .bar-wrap { display: flex; align-items: end; width: 100%; height: 140px; }
+    select { display: block; width: 100%; margin-top: 6px; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; background: white; }
+    input[type="range"] { padding: 0; accent-color: #2563eb; }
+    .volume-readout { display: flex; justify-content: space-between; color: #64748b; font-variant-numeric: tabular-nums; }
+    .weekday-limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+    .chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 12px; height: 205px; padding-top: 10px; }
+    .day { display: flex; flex-direction: column; justify-content: end; align-items: center; gap: 7px; height: 100%; min-width: 0; color: #64748b; font-size: .8rem; }
+    .day-value { display: flex; align-items: end; justify-content: center; min-height: 2.2em; text-align: center; line-height: 1.1; overflow-wrap: anywhere; }
+    .day-label { display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+    .day-weekday { color: #334155; font-weight: 700; }
+    .bar-wrap { display: flex; align-items: end; width: 100%; height: 125px; }
     .bar { width: 100%; min-height: 2px; border-radius: 6px 6px 0 0; background: #60a5fa; }
     .notice { margin-top: 12px; color: #b91c1c; min-height: 1.4em; }
     @media (max-width: 480px) { body { padding: 20px 12px; } .card { padding: 17px; } .chart { gap: 6px; } }
@@ -394,40 +503,93 @@ PAGE = """<!doctype html>
 <body>
 <main>
   <h1>ゲーム時間マネージャー</h1>
-  <p class="subtitle">ゲームの使用時間を記録し、決めた上限を守りましょう。</p>
-  <div class="grid">
+  <p class="subtitle">登録したゲームを自動検出して使用時間を記録します。</p>
+  <section class="view" id="home-view">
+    <div class="home-actions">
+      <button class="nav-card" type="button" data-view-target="sound-view">
+        <span class="nav-icon" aria-hidden="true">🔔</span>
+        <span><strong>通知音の設定</strong><small>音の種類や音量を調整</small></span>
+      </button>
+      <button class="nav-card" type="button" data-view-target="time-view">
+        <span class="nav-icon" aria-hidden="true">⏱</span>
+        <span><strong>時間設定</strong><small>曜日ごとの上限を設定</small></span>
+      </button>
+    </div>
     <section class="card">
       <h2>現在の状態</h2>
       <p class="state" id="state">読み込み中</p>
       <p class="message" id="message" aria-live="polite"></p>
       <div class="stats">
         <span>今日の使用時間</span><strong id="daily-usage">--</strong>
+        <span>今日の上限</span><strong id="daily-limit-display">--</strong>
         <span>今日の残り時間</span><strong id="daily-remaining">--</strong>
         <span>今週の使用時間</span><strong id="weekly-usage">--</strong>
-        <span>今週の残り時間</span><strong id="weekly-remaining">--</strong>
       </div>
-      <div class="buttons">
-        <button id="start" type="button" onclick="sessionAction('start')">ゲーム開始</button>
-        <button class="stop" id="stop" type="button" onclick="sessionAction('stop')">ゲーム終了</button>
-      </div>
+      <p>計測対象: <strong id="tracked-processes">未設定</strong></p>
       <p class="notice" id="notice" role="alert"></p>
     </section>
+    <section class="card" style="margin-top:16px">
+      <h2>今週（月曜日〜日曜日）の使用時間</h2>
+      <div class="chart" id="chart" aria-label="今週の月曜日から日曜日までの日別使用時間グラフ"></div>
+    </section>
+  </section>
+  <section class="view" id="time-view" hidden>
+    <div class="view-heading">
+      <button class="back-button" type="button" data-view-target="home-view">← ホーム</button>
+      <h2>時間設定</h2>
+    </div>
     <section class="card">
-      <h2>制限設定</h2>
-      <form id="limits-form">
-        <label>1日の上限（時間）<input id="daily-limit" type="number" min="0.1" max="24" step="0.1" required></label>
-        <label>1週間の上限（時間）<input id="weekly-limit" type="number" min="0.1" max="168" step="0.1" required></label>
-        <button type="submit">制限を保存</button>
+      <h2>月曜日〜金曜日の一日の上限</h2>
+      <form id="settings-form">
+        <div class="weekday-limits">
+          <label>月<input id="limit-0" type="number" min="0" max="24" step="0.1" required></label>
+          <label>火<input id="limit-1" type="number" min="0" max="24" step="0.1" required></label>
+          <label>水<input id="limit-2" type="number" min="0" max="24" step="0.1" required></label>
+          <label>木<input id="limit-3" type="number" min="0" max="24" step="0.1" required></label>
+          <label>金<input id="limit-4" type="number" min="0" max="24" step="0.1" required></label>
+        </div>
+        <label>ゲームの実行ファイル名（カンマ区切り）
+          <input id="process-names" type="text" placeholder="game.exe, another-game.exe" autocomplete="off">
+        </label>
+        <p>ゲームを起動すると自動計測します。上限を超えてもゲームは自動終了しません。プロセス名はタスクマネージャーで確認できます。</p>
+        <button type="submit">設定を保存</button>
+        <p class="notice" id="time-notice" role="status"></p>
       </form>
     </section>
-  </div>
-  <section class="card" style="margin-top:16px">
-    <h2>過去7日間の使用量（分）</h2>
-    <div class="chart" id="chart" aria-label="過去7日間の使用量グラフ"></div>
+  </section>
+  <section class="view" id="sound-view" hidden>
+    <div class="view-heading">
+      <button class="back-button" type="button" data-view-target="home-view">← ホーム</button>
+      <h2>通知音の設定</h2>
+    </div>
+    <section class="card">
+      <form id="sound-form">
+        <label>通知音の種類
+          <select id="notification-tone">
+            <option value="chime">チャイム</option>
+            <option value="bell">ベル</option>
+            <option value="soft">やさしい音</option>
+          </select>
+        </label>
+        <label for="notification-volume">音量</label>
+        <input id="notification-volume" type="range" min="0" max="100" step="1">
+        <div class="volume-readout"><span>ミュート</span><output id="volume-value">50%</output><span>最大</span></div>
+        <p>上限の80%で通知し、上限到達時は音を繰り返します。試聴ボタンで確認できます。</p>
+        <div class="home-actions">
+          <button type="submit">設定を保存</button>
+          <button class="secondary-button" id="preview-sound" type="button">試聴する</button>
+        </div>
+        <p class="notice" id="sound-notice" role="status"></p>
+      </form>
+    </section>
   </section>
 </main>
 <script>
   const $ = (id) => document.getElementById(id);
+  let audioContext;
+  let observedDay = null;
+  let previousDailyUsage = null;
+  let notificationSettingsLoaded = false;
   const formatMinutes = (minutes) => {
     const seconds = Math.max(0, Math.floor(minutes * 60));
     const hours = Math.floor(seconds / 3600);
@@ -435,6 +597,66 @@ PAGE = """<!doctype html>
     const secs = seconds % 60;
     return [hours, mins, secs].map((n) => String(n).padStart(2, '0')).join(':');
   };
+  const formatChartMinutes = (minutes) => {
+    const totalMinutes = Math.floor(minutes);
+    const hours = Math.floor(totalMinutes / 60);
+    const mins = totalMinutes % 60;
+    return hours ? `${hours}時間${mins ? `${mins}分` : ''}` : `${mins}分`;
+  };
+  function updateVolumeReadout() {
+    const volume = Number($('notification-volume').value);
+    $('volume-value').textContent = volume === 0 ? 'ミュート' : `${volume}%`;
+  }
+  async function playNotificationSound(settings, urgent = false) {
+    if (settings.volume === 0) return;
+    if (!window.AudioContext) throw new Error('このブラウザーでは通知音を再生できません。');
+    audioContext = audioContext || new AudioContext();
+    await audioContext.resume();
+    const presets = {
+      chime: { type: 'triangle', frequencies: [784, 988, 1175], duration: 0.18 },
+      bell: { type: 'triangle', frequencies: [988, 1318], duration: 0.2 },
+      soft: { type: 'sine', frequencies: [523, 659], duration: 0.24 }
+    };
+    const preset = presets[settings.tone];
+    if (!preset) throw new Error('通知音の種類を確認してください。');
+    let startAt = audioContext.currentTime;
+    const frequencies = urgent
+      ? [...preset.frequencies, ...preset.frequencies]
+      : preset.frequencies;
+    for (const frequency of frequencies) {
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      const endAt = startAt + preset.duration;
+      oscillator.type = preset.type;
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.0001, startAt);
+      gain.gain.linearRampToValueAtTime(settings.volume / 100 * 0.3, startAt + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, endAt);
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start(startAt);
+      oscillator.stop(endAt);
+      startAt = endAt + 0.06;
+    }
+  }
+  function checkUsageAlerts(data) {
+    if (observedDay !== data.today) {
+      observedDay = data.today;
+      previousDailyUsage = data.daily_usage;
+      return;
+    }
+    const previous = previousDailyUsage;
+    previousDailyUsage = data.daily_usage;
+    if (previous === null || data.daily_limit === null || data.notification_settings.volume === 0) return;
+    const limit = data.daily_limit;
+    const reachedLimit = data.daily_usage >= limit &&
+      (previous < limit || (limit === 0 && data.daily_usage > previous));
+    const reachedWarning = limit > 0 && previous < limit * 0.8 && data.daily_usage >= limit * 0.8;
+    if (!reachedLimit && !reachedWarning) return;
+    playNotificationSound(data.notification_settings, reachedLimit).catch((error) => {
+      $('notice').textContent = error.message;
+    });
+  }
   async function request(path, data) {
     const response = await fetch(path, {
       method: data ? 'POST' : 'GET',
@@ -453,60 +675,100 @@ PAGE = """<!doctype html>
       const day = document.createElement('div');
       day.className = 'day';
       const value = document.createElement('span');
-      value.textContent = String(item.usage);
+      value.className = 'day-value';
+      value.textContent = formatChartMinutes(item.usage);
       const wrap = document.createElement('div');
       wrap.className = 'bar-wrap';
       const bar = document.createElement('div');
       bar.className = 'bar';
       bar.style.height = `${Math.max(2, Math.min(100, item.usage / max * 100))}%`;
       wrap.append(bar);
-      const label = document.createElement('span');
-      label.textContent = item.date.slice(5);
+      const label = document.createElement('div');
+      label.className = 'day-label';
+      const weekday = document.createElement('span');
+      weekday.className = 'day-weekday';
+      weekday.textContent = item.weekday;
+      const dateLabel = document.createElement('span');
+      dateLabel.textContent = `${Number(item.date.slice(8))}日`;
+      label.title = item.date;
+      label.append(weekday, dateLabel);
       day.append(value, wrap, label);
       chart.append(day);
     }
   }
+  document.querySelectorAll('[data-view-target]').forEach((button) => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('.view').forEach((view) => {
+        view.hidden = view.id !== button.dataset.viewTarget;
+      });
+    });
+  });
+  $('notification-volume').addEventListener('input', updateVolumeReadout);
   async function refresh() {
     try {
       const data = await request('/api/status');
       $('state').textContent = data.state;
       $('state').dataset.state = data.state;
       $('message').textContent = data.message;
-      $('daily-usage').textContent = `${formatMinutes(data.daily_usage)} / ${formatMinutes(data.daily_limit)}`;
-      $('daily-remaining').textContent = formatMinutes(data.daily_remaining);
-      $('weekly-usage').textContent = `${formatMinutes(data.weekly_usage)} / ${formatMinutes(data.weekly_limit)}`;
-      $('weekly-remaining').textContent = formatMinutes(data.weekly_remaining);
-      $('start').disabled = !data.can_start;
-      $('stop').disabled = !data.active;
-      if (document.activeElement !== $('daily-limit')) $('daily-limit').value = (data.daily_limit / 60).toFixed(1);
-      if (document.activeElement !== $('weekly-limit')) $('weekly-limit').value = (data.weekly_limit / 60).toFixed(1);
+      $('daily-usage').textContent = formatMinutes(data.daily_usage);
+      $('daily-limit-display').textContent = data.daily_limit === null ? '設定なし' : formatMinutes(data.daily_limit);
+      $('daily-remaining').textContent = data.daily_remaining === null ? '—' : formatMinutes(data.daily_remaining);
+      $('weekly-usage').textContent = formatMinutes(data.weekly_usage);
+      $('tracked-processes').textContent = data.process_names.join(', ') || '未設定';
+      if (!notificationSettingsLoaded) {
+        $('notification-tone').value = data.notification_settings.tone;
+        $('notification-volume').value = data.notification_settings.volume;
+        notificationSettingsLoaded = true;
+      }
+      updateVolumeReadout();
+      for (let day = 0; day < 5; day++) {
+        const input = $(`limit-${day}`);
+        if (document.activeElement !== input) input.value = (data.weekday_limits[day] / 60).toFixed(1);
+      }
+      if (document.activeElement !== $('process-names')) $('process-names').value = data.process_names.join(', ');
       drawChart(data.history);
+      checkUsageAlerts(data);
     } catch (error) {
       $('notice').textContent = error.message;
     }
   }
-  async function sessionAction(action) {
-    $('notice').textContent = '';
-    try {
-      const result = await request(`/api/${action}`, {});
-      $('message').textContent = result.message;
-      await refresh();
-    } catch (error) {
-      $('notice').textContent = error.message;
-    }
-  }
-  $('limits-form').addEventListener('submit', async (event) => {
+  $('settings-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     $('notice').textContent = '';
     try {
-      const result = await request('/api/limits', {
-        daily_hours: $('daily-limit').value,
-        weekly_hours: $('weekly-limit').value
+      const result = await request('/api/settings', {
+        weekday_hours: Array.from({length: 5}, (_, day) => $(`limit-${day}`).value),
+        process_names: $('process-names').value.split(/[,\\n;]/).map((name) => name.trim()).filter(Boolean)
       });
-      $('message').textContent = result.message;
+      $('time-notice').textContent = result.message;
       await refresh();
     } catch (error) {
-      $('notice').textContent = error.message;
+      $('time-notice').textContent = error.message;
+    }
+  });
+  $('sound-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    $('sound-notice').textContent = '';
+    try {
+      const result = await request('/api/notification-settings', {
+        tone: $('notification-tone').value,
+        volume: Number($('notification-volume').value)
+      });
+      $('sound-notice').textContent = result.message;
+      await refresh();
+    } catch (error) {
+      $('sound-notice').textContent = error.message;
+    }
+  });
+  $('preview-sound').addEventListener('click', async () => {
+    $('sound-notice').textContent = '';
+    try {
+      await playNotificationSound({
+        tone: $('notification-tone').value,
+        volume: Number($('notification-volume').value)
+      });
+    } catch (error) {
+      $('sound-notice').textContent = error.message;
     }
   });
   refresh();
@@ -522,7 +784,7 @@ class GameTimeHTTPServer(HTTPServer):
         super().__init__(server_address, GameTimeRequestHandler)
 
     def service_actions(self):
-        self.manager.enforce_limits()
+        self.manager.scan_processes()
 
 
 class GameTimeRequestHandler(BaseHTTPRequestHandler):
@@ -549,7 +811,7 @@ class GameTimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "ページが見つかりません。"}, 404)
 
     def do_POST(self):
-        if self.path not in {"/api/start", "/api/stop", "/api/limits"}:
+        if self.path not in {"/api/settings", "/api/notification-settings"}:
             self._send_json({"error": "ページが見つかりません。"}, 404)
             return
         try:
@@ -560,17 +822,19 @@ class GameTimeRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("リクエストの内容を確認してください。")
             manager = self.server.manager
-            if self.path == "/api/start":
-                success, message = manager.start_session()
-                self._send_json({"success": success, "message": message}, 200 if success else 409)
-            elif self.path == "/api/stop":
-                if not manager.stop_session():
-                    self._send_json({"error": "ゲームセッションは開始されていません。"}, 409)
-                    return
-                self._send_json({"success": True, "message": manager.message})
+            if self.path == "/api/settings":
+                manager.save_settings(
+                    payload.get("weekday_hours"),
+                    payload.get("process_names"),
+                )
+                message = "時間設定を保存しました。"
             else:
-                manager.save_limits(payload.get("daily_hours"), payload.get("weekly_hours"))
-                self._send_json({"success": True, "message": manager.message})
+                manager.save_notification_settings(
+                    payload.get("tone"),
+                    payload.get("volume"),
+                )
+                message = "通知音の設定を保存しました。"
+            self._send_json({"success": True, "message": message})
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             self._send_json({"error": str(error) or "入力値を確認してください。"}, 400)
 
@@ -839,7 +1103,15 @@ def main():
 
     manager = WebGameTimeManager()
     server = GameTimeHTTPServer((args.host, args.port), manager)
-    print(f"ブラウザで開いてください: http://{args.host}:{args.port}/")
+    browser_host = args.host
+    if browser_host in {"0.0.0.0", "::"}:
+        browser_host = "127.0.0.1"
+    if ":" in browser_host:
+        browser_host = f"[{browser_host}]"
+    url = f"http://{browser_host}:{server.server_port}/"
+    print(f"アプリのURL: {url}")
+    if not webbrowser.open(url):
+        print("ブラウザを自動で開けませんでした。上記URLを手動で開いてください。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
